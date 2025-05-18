@@ -1,0 +1,13 @@
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Временные файлы
+*.log
+*.tmp
+tmp/
+
+# Зависимости и сборки
+node_modules/
+dist/
+build/
