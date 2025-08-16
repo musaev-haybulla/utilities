@@ -58,6 +58,7 @@ init_config() {
     read -s -p "Пароль: " db_pass
     echo
     read -p "Имя базы данных: " db_name
+    read -p "Docker контейнер (необязательно): " docker_container
     
     cat > "$CONFIG_FILE" <<EOL
 # Конфигурация db-tools
@@ -65,6 +66,7 @@ DB_HOST="${db_host:-127.0.0.1}"
 DB_USER="${db_user:-root}"
 DB_PASS="$db_pass"
 DB_NAME="$db_name"
+DOCKER_CONTAINER="$docker_container"
 DBML_FILE="db.dbml"
 DUMP_FILE="data.sql"
 EOL
@@ -75,7 +77,14 @@ EOL
 # Update DBML schema
 update_schema() {
     echo -e "${YELLOW}Обновление DBML схемы...${NC}"
-    mysql_to_dbdiagram -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -o "$PROJECT_DIR/$DBML_FILE"
+    
+    local cmd_args="-u $DB_USER -p$DB_PASS $DB_NAME -o $PROJECT_DIR/$DBML_FILE"
+    
+    if [ -n "$DOCKER_CONTAINER" ]; then
+        mysql_to_dbdiagram --docker "$DOCKER_CONTAINER" $cmd_args
+    else
+        mysql_to_dbdiagram -h "$DB_HOST" $cmd_args
+    fi
     
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}✓ DBML схема обновлена: $PROJECT_DIR/$DBML_FILE${NC}"
@@ -85,12 +94,43 @@ update_schema() {
     fi
 }
 
+# Create MySQL config file to avoid password warnings
+create_mysql_config() {
+    local config_file=$(mktemp)
+    cat > "$config_file" <<EOL
+[client]
+user = $DB_USER
+password = $DB_PASS
+host = ${DB_HOST:-localhost}
+port = ${DB_PORT:-3306}
+
+[mysqldump]
+user = $DB_USER
+password = $DB_PASS
+host = ${DB_HOST:-localhost}
+port = ${DB_PORT:-3306}
+EOL
+    echo "$config_file"
+}
+
 # Dump database
 dump_data() {
     echo -e "${YELLOW}Создание дампа базы данных...${NC}"
-    mysqldump -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" --no-tablespaces "$DB_NAME" > "$PROJECT_DIR/$DUMP_FILE"
     
-    if [ $? -eq 0 ]; then
+    local config_file=$(create_mysql_config)
+    
+    if [ -n "$DOCKER_CONTAINER" ]; then
+        docker cp "$config_file" "$DOCKER_CONTAINER:/tmp/mysql_dump_config"
+        docker exec "$DOCKER_CONTAINER" mysqldump --defaults-file=/tmp/mysql_dump_config --no-tablespaces "$DB_NAME" > "$PROJECT_DIR/$DUMP_FILE"
+        docker exec "$DOCKER_CONTAINER" rm -f /tmp/mysql_dump_config
+    else
+        mysqldump --defaults-file="$config_file" --no-tablespaces "$DB_NAME" > "$PROJECT_DIR/$DUMP_FILE"
+    fi
+    
+    local result=$?
+    rm -f "$config_file"
+    
+    if [ $result -eq 0 ]; then
         echo -e "${GREEN}✓ Дамп базы данных создан: $PROJECT_DIR/$DUMP_FILE${NC}"
     else
         echo -e "${RED}Ошибка: Не удалось создать дамп базы данных${NC}"

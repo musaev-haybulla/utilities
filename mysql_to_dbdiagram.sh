@@ -15,12 +15,14 @@ show_help() {
   echo "  -h, --host HOST      Хост MySQL (по умолчанию: localhost)"
   echo "  -P, --port PORT      Порт MySQL (по умолчанию: 3306)"
   echo "  -o, --output FILE    Выходной файл (по умолчанию: <база>_schema.dbdiagram)"
+  echo "  --docker CONTAINER   Использовать Docker контейнер"
   echo "  --version            Показать версию"
   echo "  --help               Показать эту справку"
   echo
   echo "Примеры:"
   echo "  mysql_to_dbdiagram my_database"
   echo "  mysql_to_dbdiagram -u dev_user -p secret -h db.server.com my_database"
+  echo "  mysql_to_dbdiagram --docker mysql_container my_database"
 }
 
 # Парсинг аргументов
@@ -44,6 +46,9 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     -o|--output)
       OUTPUT_FILE="$2"; shift
+      ;;
+    --docker)
+      DOCKER_CONTAINER="$2"; shift
       ;;
     --version)
       echo "mysql_to_dbdiagram v$VERSION"; exit 0
@@ -77,10 +82,34 @@ if [ -z "${DB_PASS+x}" ]; then
   echo
 fi
 
+# Создаем временный файл конфигурации MySQL
+create_mysql_config() {
+  MYSQL_CONFIG_FILE=$(mktemp)
+  cat > "$MYSQL_CONFIG_FILE" <<EOL
+[client]
+user = $DB_USER
+password = $DB_PASS
+host = $DB_HOST
+port = $DB_PORT
+EOL
+  echo "$MYSQL_CONFIG_FILE"
+}
+
 # Функция для выполнения SQL-запроса
 execute_mysql_query() {
   local query="$1"
-  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" --skip-column-names -e "$query" "$DB_NAME"
+  local config_file=$(create_mysql_config)
+  
+  if [ -n "$DOCKER_CONTAINER" ]; then
+    # Копируем конфиг в контейнер и используем его
+    docker cp "$config_file" "$DOCKER_CONTAINER:/tmp/mysql_config"
+    docker exec "$DOCKER_CONTAINER" mysql --defaults-file=/tmp/mysql_config --skip-column-names -e "$query" "$DB_NAME"
+    docker exec "$DOCKER_CONTAINER" rm -f /tmp/mysql_config
+  else
+    mysql --defaults-file="$config_file" --skip-column-names -e "$query" "$DB_NAME"
+  fi
+  
+  rm -f "$config_file"
 }
 
 # Генерируем схему таблиц
@@ -89,7 +118,20 @@ generate_tables_schema() {
   local nl=$'\n'
   
   # Проверка соединения с базой
-  if ! mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -e "USE $DB_NAME" 2>/dev/null; then
+  local config_file=$(create_mysql_config)
+  local test_result
+  
+  if [ -n "$DOCKER_CONTAINER" ]; then
+    docker cp "$config_file" "$DOCKER_CONTAINER:/tmp/mysql_test_config"
+    test_result=$(docker exec "$DOCKER_CONTAINER" mysql --defaults-file=/tmp/mysql_test_config -e "USE $DB_NAME" 2>/dev/null && echo "OK")
+    docker exec "$DOCKER_CONTAINER" rm -f /tmp/mysql_test_config
+  else
+    test_result=$(mysql --defaults-file="$config_file" -e "USE $DB_NAME" 2>/dev/null && echo "OK")
+  fi
+  
+  rm -f "$config_file"
+  
+  if [ "$test_result" != "OK" ]; then
     echo "ERROR: Не удалось подключиться к базе $DB_NAME" >&2
     exit 1
   fi
@@ -113,7 +155,15 @@ generate_tables_schema() {
   # Если нет таблиц, проверяем соединение с базой и наличие в ней таблиц
   if [ ${#tables[@]} -eq 0 ]; then
     echo "DEBUG: Выводим список всех таблиц в базе $DB_NAME:" >&2
-    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -e "SHOW TABLES" "$DB_NAME" >&2
+    local debug_config=$(create_mysql_config)
+    if [ -n "$DOCKER_CONTAINER" ]; then
+      docker cp "$debug_config" "$DOCKER_CONTAINER:/tmp/mysql_debug_config"
+      docker exec "$DOCKER_CONTAINER" mysql --defaults-file=/tmp/mysql_debug_config -e "SHOW TABLES" "$DB_NAME" >&2
+      docker exec "$DOCKER_CONTAINER" rm -f /tmp/mysql_debug_config
+    else
+      mysql --defaults-file="$debug_config" -e "SHOW TABLES" "$DB_NAME" >&2
+    fi
+    rm -f "$debug_config"
   fi
   
   # Для каждой таблицы генерируем схему
@@ -283,10 +333,17 @@ generate_references() {
 
 # Основная функция
 main() {
-  # Проверяем доступность mysql клиента
-  if ! command -v mysql &> /dev/null; then
-    echo "Ошибка: mysql клиент не установлен или не в PATH"
-    exit 1
+  # Проверяем доступность mysql клиента или docker
+  if [ -n "$DOCKER_CONTAINER" ]; then
+    if ! command -v docker &> /dev/null; then
+      echo "Ошибка: docker не установлен или не в PATH"
+      exit 1
+    fi
+  else
+    if ! command -v mysql &> /dev/null; then
+      echo "Ошибка: mysql клиент не установлен или не в PATH"
+      exit 1
+    fi
   fi
 
   echo "Генерация схемы для базы данных '$DB_NAME'..."
